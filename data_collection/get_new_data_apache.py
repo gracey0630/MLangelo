@@ -12,6 +12,8 @@ from io import StringIO
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 from google.cloud import storage
+from google.cloud import bigquery
+
 
 ####################################################
 # CONFIGURATION
@@ -25,6 +27,10 @@ SUBREDDITS = [DALLE_SUBR, MIDJ_SUBR, AIART_SUBR]
 # GCS Configuration
 GCS_BUCKET = "art-bkt" 
 GCS_PROJECT = "eecs6893-471617"
+
+# BigQuery config
+DATASET_ID = "reddit_scrape"
+TABLE_ID = "image_metadata"
 
 # Reddit API Configuration
 REDDIT_CLIENT_ID = os.getenv('REDDIT_CLIENT_ID', '')
@@ -191,7 +197,7 @@ def upload_new_images_to_gcs(**context):
     
     stats['images'] = new_images
     
-    # Log summary
+    # log summary
     logger.info(f"\nProcessing summary for r/{subr}:")
     logger.info(f"  Total posts checked: {stats['checked']}")
     logger.info(f"  Passed flair filter: {stats['passed_flair']}")
@@ -200,16 +206,17 @@ def upload_new_images_to_gcs(**context):
     logger.info(f"  New images: {stats['new_images']}")
     logger.info(f"  Download errors: {stats['download_errors']}")
     
-    # Push stats and images to XCom for next task
+    # push stats and images to XCom for next task
     context['task_instance'].xcom_push(key=f'{subr}_stats', value=stats)
     context['task_instance'].xcom_push(key=f'{subr}_images', value=new_images)
     
     return stats
 
+
 def update_metadata_csv(**context):
-    """ update metadata.csv in GCS """
+    """ update metadata.csv in GCS bucket """
     
-    # get
+    # get the image metadata from previous task
     subr = context['params']['subr']
     new_images = context['task_instance'].xcom_pull(key=f'{subr}_images')
     
@@ -240,22 +247,23 @@ def update_metadata_csv(**context):
             else:
                 df_existing = None
             
-            # Create DataFrame from new images
+            # create DataFrame from new images
             df_new = pd.DataFrame([{
                 'submission_id': img['submission_id'],
                 'filename': img['filename'],
                 'url': img['url'],
                 'subreddit': img['subreddit'],
-                'date': img['date']
+                'date': img['date'],
             } for img in images])
             
-            # Combine with existing data
+            # combine with existing data
             if df_existing is not None:
                 df_combined = pd.concat([df_existing, df_new], ignore_index=True)
+                df_combined = df_combined.drop_duplicates(subset=['submission_id'], keep='first') # handle duplicates
             else:
                 df_combined = df_new
             
-            # Upload to GCS
+            # upload to GCS
             csv_string = df_combined.to_csv(index=False)
             blob.upload_from_string(csv_string, content_type='text/csv')
             
@@ -265,18 +273,154 @@ def update_metadata_csv(**context):
         logger.error(f"Error updating metadata for r/{subr}: {e}")
 
 
+def create_bigquery_table(**context):
+    """ 
+    create metadata table for the existing images from bkt to bigquery table 
+    uses the metadata.csv from dalle and midjourney folder
+    adds a 'model' column set to the subreddit name
+    """
+
+    client = bigquery.Client()
+
+    # create dataset bc dataset contains table
+    dataset_ref = f"{client.project}.{DATASET_ID}"
+    dataset = bigquery.Dataset(dataset_ref)
+    dataset.location = "US"
+    
+    try:
+        dataset = client.create_dataset(dataset, exists_ok=True)
+        logger.info(f"dataset {dataset} created or already exists")
+    except Exception as e:
+        logger.error(f"error creating dataset: {e}")
+        return
+
+    # create table if it doesn't exist (should only run once)
+    # if it already exists -- return and do nothing
+    table_ref = f"{client.project}.{DATASET_ID}.{TABLE_ID}"
+    schema = [
+        bigquery.SchemaField("submission_id", "STRING"),
+        bigquery.SchemaField("filename", "STRING"),
+        bigquery.SchemaField("url", "STRING"),
+        bigquery.SchemaField("subreddit", "STRING"),
+        bigquery.SchemaField("date", "TIMESTAMP"),
+        bigquery.SchemaField("model", "STRING")
+    ]
+
+    table = bigquery.Table(table_ref, schema)
+    
+    try:
+        client.create_table(table)
+        logger.info(f"created table {table_ref}")
+    except Exception as e:
+        logger.info(f"{e}")
+        return
+
+    # load metadata csv from gcs
+    storage_client = storage.Client()
+    bucket = storage_client.bucket(GCS_BUCKET)
+
+    # only the model folders
+    for subr in ["dalle2", "midjourney"]:
+        blob = bucket.blob(f"{subr}/metadata.csv")
+
+        if blob.exists():
+
+            # read csv from GCS into datafrane
+            csv_data = blob.download_as_string().decode('utf-8')
+            df = pd.read_csv(StringIO(csv_data))
+
+            # convert date into datetime
+            df['date'] = pd.to_datetime(df['date'])
+
+            # add model name column
+            model_name = "dalle" if subr == "dalle2" else "midjourney"
+            df['model'] = model_name
+        
+            # job settings for loading df to table
+            job_config = bigquery.LoadJobConfig(
+                write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
+            )
+
+            # load metadata into bigquery table
+            load_job = client.load_table_from_dataframe(df, table_ref, job_config=job_config)
+            load_job.result()
+            logger.info(f"Loaded {subr}/metadata.csv to BigQuery with model={subr}")
+
+
+
+def update_bigquery_table(**context):
+    """ 
+    append metadata for the new images to bigquery table 
+    
+    passed in parameter has this structure
+    {
+    'submission_id': submission.id,
+    'filename': filename,
+    'url': submission.url,
+    'subreddit': subr,
+    'date': datetime.fromtimestamp(submission.created_utc).isoformat(),
+    'target_subr': target_subr, - indicates which model that the image is from
+    }
+    """
+
+    # get the image metadata from previous collection task & get the subreddit name
+    subr = context['params']['subr']
+    new_images = context['task_instance'].xcom_pull(key=f'{subr}_images')
+
+    # no new images
+    if not new_images:
+        logger.info(f"No new images for r/{subr}, skipping BigQuery update")
+        return
+    
+    client = bigquery.Client()
+
+    # only the rows that are not in bigquery since it is just getting scraped
+    new_rows = [
+                {
+                    'submission_id': img['submission_id'],
+                    'filename': img['filename'],
+                    'url': img['url'],
+                    'subreddit': img['subreddit'],
+                    'date': img['date'],
+                    'model': img['target_subr'] # which model the image is from
+                }
+                for img in new_images
+            ]
+    
+    table_ref = f"{client.project}.{DATASET_ID}.{TABLE_ID}"
+
+    # double check for duplicate rows by query
+    # (theoretically it shouldn't exists since new_images should only be images that are not in subreddit)
+    query = f"SELECT DISTINCT submission_id FROM `{table_ref}`"
+    existing_id = {row.submission_id for row in client.query(query).result()}
+    new_rows_to_insert = [row for row in new_rows if row['submission_id'] not in existing_id]
+
+    if not new_rows_to_insert:
+        logger.info(f"All {len(new_rows)} rows already exist in BigQuery for r/{subr}")
+        return
+    
+    # insert rows into bigquery / handle error
+    errors = client.insert_rows_json(table_ref, new_rows_to_insert)
+
+    if errors:
+        logger.error(f"BigQuery insert errors: {errors}")
+        raise Exception(f"Failed to insert rows: {errors}")
+    else:
+        logger.info(f"Inserted {len(new_rows_to_insert)} rows to BigQuery for r/{subr}")
+    
+
 def create_daily_log(**context):
     """ create and upload daily log to GCS """
     
     all_stats = []
     
-    # Pull stats from all subreddit tasks
+    # pull stats from all subreddit tasks
     for subr in SUBREDDITS:
         stats = context['task_instance'].xcom_pull(task_ids=f'collect_images_{subr}', key=f'{subr}_stats')
         if stats:  # Only append if stats exist
            all_stats.append(stats)
     
-    # Create daily log
+    # create daily log
     log_data = {
         'date': datetime.now().isoformat(),
         'subreddit_stats': all_stats,
@@ -284,7 +428,7 @@ def create_daily_log(**context):
         'total_errors': sum(s['download_errors'] for s in all_stats),
     }
     
-    # Upload log to GCS
+    # upload log to GCS
     storage_client = storage.Client()
     bucket = storage_client.bucket(GCS_BUCKET)
     
@@ -302,6 +446,7 @@ def create_daily_log(**context):
     logger.info(f"Log uploaded to GCS: gs://{GCS_BUCKET}/{log_filename}")
     logger.info("="*70 + "\n")
 
+
 ####################################################
 # AIRFLOW DAG
 ####################################################
@@ -310,7 +455,7 @@ default_args = {
     'owner': 'gy2354',
     'depends_on_past': False,
     'start_date': datetime(2025, 1, 1),
-    'email': ['gy2354@ecolumbia.edu'],
+    'email': ['gy2354@columbia.edu'],
     'email_on_failure': True,
     'email_on_retry': True,
     'retries': 1,
@@ -326,9 +471,19 @@ dag = DAG(
     tags=['reddit', 'data-collection', 'gcs'],
 )
 
-# Create tasks for each subreddit
+# one time task
+# create bigquery table from existing metadata.csv 
+# should only run once and after if should just return
+create_table_task = PythonOperator(
+    task_id = f'create_table',
+    python_callable = create_bigquery_table,
+    dag = dag,
+)
+
+# create tasks for each subreddit
 collect_tasks = {}
 metadata_tasks = {}
+update_table_tasks = {}
 
 for subr in SUBREDDITS:
     # collect and upload images
@@ -339,24 +494,34 @@ for subr in SUBREDDITS:
         dag=dag,
     )
     
-    # Update metadata CSV
+    # update metadata CSV
     metadata_tasks[subr] = PythonOperator(
         task_id=f'update_metadata_{subr}',
         python_callable=update_metadata_csv,
         params={'subr': subr},
         dag=dag,
     )
-    
-    # Set dependencies
-    collect_tasks[subr] >> metadata_tasks[subr] 
 
-# Create daily log after all uploads complete
+    update_table_tasks[subr] = PythonOperator(
+        task_id = f'update_table_{subr}',
+        python_callable = update_bigquery_table,
+        params={'subr': subr},
+        dag=dag,
+    )
+
+    # first collect all the images and add to metadata csv per model type
+    collect_tasks[subr] >> metadata_tasks[subr] >> update_table_tasks[subr]
+
+# create table before start executing
+create_table_task >> list(collect_tasks.values())
+
+# create daily log after all uploads complete
 create_log = PythonOperator(
     task_id='create_daily_log',
     python_callable=create_daily_log,
     dag=dag,
 )
 
-# All upload tasks must complete before log creation
+# all upload tasks must complete before log creation
 for subr in SUBREDDITS:
-    metadata_tasks[subr] >> create_log
+    update_table_tasks[subr] >> create_log
