@@ -1,0 +1,62 @@
+{
+  "class_metrics": {
+    "Art": {
+      "total": 837,
+      "correct": 571,
+      "misclassified": 266,
+      "accuracy": 68.21983273596177,
+      "misclassified_percentage": 31.780167264038234,
+      "recall": 68.21983273596177
+    },
+    "dalle2": {
+      "total": 313,
+      "correct": 1,
+      "misclassified": 312,
+      "accuracy": 0.3194888178913738,
+      "misclassified_percentage": 99.68051118210863,
+      "recall": 0.3194888178913738
+    },
+    "midjourney": {
+      "total": 362,
+      "correct": 1,
+      "misclassified": 361,
+      "accuracy": 0.27624309392265195,
+      "misclassified_percentage": 99.72375690607734,
+      "recall": 0.27624309392265195
+    }
+  },
+  "susy_class_metrics": {
+    "authentic": {
+      "total": 837,
+      "correct": 571,
+      "misclassified": 266,
+      "accuracy": 68.21983273596177,
+      "misclassified_percentage": 31.780167264038234,
+      "recall": 68.21983273596177
+    },
+    "dalle-3-images": {
+      "total": 313,
+      "correct": 1,
+      "misclassified": 312,
+      "accuracy": 0.3194888178913738,
+      "misclassified_percentage": 99.68051118210863,
+      "recall": 0.3194888178913738
+    },
+    "midjourney-images": {
+      "total": 361,
+      "correct": 0,
+      "misclassified": 361,
+      "accuracy": 0.0,
+      "misclassified_percentage": 100.0,
+      "recall": 0.0
+    },
+    "midjourney_tti": {
+      "total": 1,
+      "correct": 1,
+      "misclassified": 0,
+      "accuracy": 100.0,
+      "misclassified_percentage": 0.0,
+      "recall": 100.0
+    }
+  }
+}
