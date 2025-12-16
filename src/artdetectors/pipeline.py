@@ -162,6 +162,7 @@ class ImageAnalysisPipeline:
             "pred_class": pred_class,
             "confidence": confidence,
             "probs": prob_dict,
+            "model_type": "transfer_learning_3class" if self.use_transfer_learning else "original_6class",
         }
 
     # ---------- public API (FAST) ----------
