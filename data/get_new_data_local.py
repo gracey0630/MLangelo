@@ -20,10 +20,7 @@ SUBREDDITS = [DALLE_SUBR, MIDJ_SUBR, AIART_SUBR]
 # Local data directory
 DATA_DIR = Path("data_collection/data")
 
-# Reddit API Configuration
-REDDIT_CLIENT_ID = "JT_iiB-NFwFyoknGwv5fYA"
-REDDIT_CLIENT_SECRET = "aVY6bitDc5BS8j4LX1cWusWjlgCaVQ"
-REDDIT_USER_AGENT = "mac:eecs6893Project:v1.0 (by u/Superb-Cap8523)"
+# Reddit API Configuration - redacted
 
 # Flairs from your extract_data.ipynb
 # flair for each subreddit we are scrapping
