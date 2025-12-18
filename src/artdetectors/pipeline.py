@@ -1,245 +1,258 @@
-# src/artdetectors/pipeline.py
+"""
+Gradio UI for the Art Detectors pipeline.
 
+This wraps the updated `ImageAnalysisPipeline` from `src/artdetectors/pipeline.py`
+to provide:
+- Fast analysis (CLIP styles + BLIP caption + SuSy source detection)
+- Optional restyling via Stable Diffusion img2img
+
+Run with:
+    uvicorn app:demo  # or simply `python app.py`
+"""
+
+from __future__ import annotations
+
+import os
+import sys
 from pathlib import Path
-from typing import Union, Optional, Dict, List
+from typing import Dict, List, Sequence, Tuple, Union
 
-import torch
+import gradio as gr
 from PIL import Image
-from huggingface_hub import hf_hub_download
-from torchvision import transforms
 
-from .clip_style import ClipStylePredictor
-from .blip_caption import BlipCaptioner
-from .restyle import ImageRestyler
-from .susy_transfer import SuSyTransferLearning
+# Avoid loading TensorFlow when pulling HF models
+os.environ.setdefault("TRANSFORMERS_NO_TF", "1")
+
+# Ensure local src/ is on PYTHONPATH when running without installation
+PROJECT_ROOT = Path(__file__).resolve().parent
+SRC_PATH = PROJECT_ROOT / "src"
+if SRC_PATH.exists():
+    sys.path.append(str(SRC_PATH))
+
+from artdetectors import ImageAnalysisPipeline  # noqa: E402
+
+# Cache pipelines so models are loaded only once per configuration
+_PIPELINES: Dict[str, ImageAnalysisPipeline] = {}
 
 
-def _get_default_device() -> str:
+def _get_pipeline(use_transfer_learning: bool, enable_restyler: bool) -> ImageAnalysisPipeline:
     """
-    Prefer MPS on Apple Silicon, then CUDA, then CPU.
+    Lazily create a pipeline for the requested configuration.
+
+    We keep separate instances for:
+      - Detectors only (faster; restyler disabled)
+      - Restyling (loads SD img2img; heavier)
     """
-    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        return "mps"
-    if torch.cuda.is_available():
-        return "cuda"
-    return "cpu"
+    key = f"{'tl3' if use_transfer_learning else 'orig6'}_{'restyle' if enable_restyler else 'detect'}"
+    if key not in _PIPELINES:
+        _PIPELINES[key] = ImageAnalysisPipeline(
+            use_transfer_learning=use_transfer_learning,
+            enable_restyler=enable_restyler,
+        )
+    return _PIPELINES[key]
 
 
-DEVICE = _get_default_device()
+def _format_styles(styles: Union[List[Tuple[str, float]], Sequence[Dict[str, float]]]) -> str:
+    if not styles:
+        return "No styles predicted."
+
+    lines: List[str] = []
+    first = styles[0]
+    if isinstance(first, dict):
+        for item in styles:  # type: ignore[arg-type]
+            name = item.get("style", "unknown")
+            score = float(item.get("score", 0.0))
+            lines.append(f"{name}: {score:.4f}")
+    else:
+        for name, score in styles:  # type: ignore[misc]
+            lines.append(f"{name}: {float(score):.4f}")
+    return "\n".join(lines)
 
 
-class ImageAnalysisPipeline:
-    """
-    Unified pipeline:
+def _format_susy(susy: Dict[str, object]) -> str:
+    if not susy:
+        return "No SuSy prediction."
 
-      FAST (detectors only):
-        - CLIP style prediction
-        - BLIP captioning
-        - SuSy authenticity/source classification (original or transfer learning)
+    probs = susy.get("probs", {}) or {}
+    sorted_probs = sorted(probs.items(), key=lambda kv: kv[1], reverse=True)
 
-      SLOW (separate call):
-        - Image restyling via Stable Diffusion XL img2img
-    """
+    lines = [
+        f"Prediction: {susy.get('pred_class')} ({susy.get('model_type')})",
+        f"Confidence: {float(susy.get('confidence', 0.0)):.4f}",
+        "Probabilities:",
+    ]
+    lines.extend([f"  - {k}: {float(v):.4f}" for k, v in sorted_probs])
+    return "\n".join(lines)
 
-    def __init__(
-        self,
-        style_txt_path: Union[str, Path, None] = None,
-        style_features_cache: Optional[Union[str, Path]] = None,
-        susy_repo_id: str = "HPAI-BSC/SuSy",
-        susy_filename: str = "SuSy.pt",
-        device: str = DEVICE,
-        enable_restyler: bool = True,
-        use_transfer_learning: bool = False,
-    ):
-        self.device = device
-        self.use_transfer_learning = use_transfer_learning
 
-        # ----- CLIP Style Predictor -----
-        if style_features_cache is not None:
-            cache_path = Path(style_features_cache)
-        else:
-            cache_path = Path(__file__).parent / "data" / "style_clip_features.pt"
+def _safe_int(value):
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
 
-        if cache_path.exists():
-            self.style_predictor = ClipStylePredictor.from_cached_features(
-                cache_path,
-                device=device,
-            )
-        else:
-            if style_txt_path is None:
-                style_txt_path = Path(__file__).parent / "data" / "style.txt"
-            self.style_predictor = ClipStylePredictor(
-                style_txt_path,
-                device=device,
-            )
 
-        # ---------- BLIP Captioner ----------
-        self.captioner = BlipCaptioner(device=device)
+def analyze_image(
+    image: Image.Image,
+    use_transfer_learning: bool,
+    topk_styles: int,
+    caption_prompt: str,
+):
+    if image is None:
+        return "No image uploaded.", "", ""
 
-        # ---------- SuSy Model ----------
-        model_path = hf_hub_download(repo_id=susy_repo_id, filename=susy_filename)
-        
-        if use_transfer_learning:
-            # Download from Hugging Face instead of local file
-            transfer_checkpoint = hf_hub_download(
-                repo_id="gy2354/susy-transfer-3class",
-                filename="best_model_stage2.pth"
-            )
-            
-            checkpoint_path = Path(transfer_checkpoint)
-            if not checkpoint_path.exists():
-                raise FileNotFoundError(
-                    f"Transfer learning checkpoint not found: {checkpoint_path}"
+    pipe = _get_pipeline(use_transfer_learning=use_transfer_learning, enable_restyler=False)
+    result = pipe.analyze(
+        image=image,
+        topk_styles=int(topk_styles),
+        caption_prompt=caption_prompt or None,
+    )
+
+    styles_formatted = _format_styles(result.get("styles", []))
+    susy_formatted = _format_susy(result.get("susy", {}))
+    caption = result.get("caption", "")
+
+    return caption, styles_formatted, susy_formatted
+
+
+def restyle_image(
+    image: Image.Image,
+    target_style: str,
+    caption_prompt: str,
+    negative_prompt: str,
+    strength: float,
+    guidance_scale: float,
+    num_inference_steps: int,
+    seed,
+    use_transfer_learning: bool,
+):
+    if image is None:
+        return None, "No image uploaded."
+
+    target_style = (target_style or "").strip()
+    if not target_style:
+        return None, "Please provide a target style (e.g., 'ukiyo-e', 'cubism')."
+
+    seed_val = _safe_int(seed)
+
+    pipe = _get_pipeline(use_transfer_learning=use_transfer_learning, enable_restyler=True)
+    out = pipe.restyle_image(
+        image=image,
+        target_style=target_style,
+        caption_prompt=caption_prompt or None,
+        negative_prompt=negative_prompt or None,
+        strength=float(strength),
+        guidance_scale=float(guidance_scale),
+        num_inference_steps=int(num_inference_steps),
+        seed=seed_val,
+    )
+
+    return out["restyled_image"], out["caption_used"]
+
+
+with gr.Blocks() as demo:
+    gr.Markdown("# MLAngelo — Style, Caption, Source Detection")
+    gr.Markdown(
+        "Run CLIP + BLIP + SuSy for fast analysis. Optionally restyle an image "
+        "with Stable Diffusion img2img."
+    )
+
+    with gr.Tab("Analyze"):
+        with gr.Row():
+            image_in = gr.Image(type="pil", label="Upload artwork")
+            with gr.Column():
+                use_tl = gr.Checkbox(
+                    label="Use transfer learning (3-class SuSy)",
+                    value=True,
                 )
-            
-            self.susy_model = SuSyTransferLearning(model_path, freeze_backbone=True)
-            
-            checkpoint = torch.load(checkpoint_path, map_location=device)
-            if 'model_state_dict' in checkpoint:
-                self.susy_model.load_state_dict(checkpoint['model_state_dict'])
-            else:
-                self.susy_model.load_state_dict(checkpoint)
-            
-            self.susy_model = self.susy_model.to(device)
-            self.susy_model.eval()
-            
-            self.susy_class_names: List[str] = [
-                "authentic",
-                "midjourney",
-                "dalle3",
-            ]
-        else:
-            self.susy_model = torch.jit.load(model_path, map_location=device)
-            self.susy_model.eval()
-            
-            self.susy_class_names: List[str] = [
-                "authentic",
-                "dalle-3-images",
-                "diffusiondb",
-                "midjourney-images",
-                "midjourney_tti",
-                "realisticSDXL",
-            ]
+                topk = gr.Slider(
+                    minimum=1,
+                    maximum=10,
+                    value=5,
+                    step=1,
+                    label="Top-k styles",
+                )
+                caption_prompt = gr.Textbox(
+                    label="Optional caption prompt",
+                    placeholder="e.g., 'a watercolor painting of ...'",
+                )
+                analyze_btn = gr.Button("Analyze")
 
-        self.susy_preprocess = transforms.Compose(
-            [
-                transforms.Resize((224, 224)),
-                transforms.ToTensor(),
-                transforms.Normalize(mean=[0.485, 0.456, 0.406], 
-                                   std=[0.229, 0.224, 0.225])
-            ]
+        caption_out = gr.Textbox(label="BLIP Caption", lines=6, max_lines=12)
+        styles_out = gr.Textbox(label="Top Predicted Styles", lines=8, max_lines=14)
+        susy_out = gr.Textbox(label="Source (SuSy Probabilities)", lines=10, max_lines=16)
+
+        analyze_btn.click(
+            fn=analyze_image,
+            inputs=[image_in, use_tl, topk, caption_prompt],
+            outputs=[caption_out, styles_out, susy_out],
         )
 
-        # ---------- Restyler (SDXL img2img) ----------
-        self.restyler: Optional[ImageRestyler] = (
-            ImageRestyler(device=device) if enable_restyler else None
+    with gr.Tab("Restyle"):
+        with gr.Row():
+            restyle_img_in = gr.Image(type="pil", label="Upload artwork to restyle")
+            restyle_controls = gr.Column()
+
+        with restyle_controls:
+            restyle_use_tl = gr.Checkbox(
+                label="Use transfer learning (for captioning)",
+                value=True,
+            )
+            target_style = gr.Textbox(
+                label="Target style",
+                placeholder="e.g., ukiyo-e, cubism, impressionism",
+            )
+            caption_prompt_restyle = gr.Textbox(
+                label="Optional caption prompt",
+                placeholder="Custom prompt to guide caption (restyle uses caption + target style)",
+            )
+            negative_prompt = gr.Textbox(
+                label="Negative prompt (optional)",
+                placeholder="blurry, distorted, noisy",
+            )
+            strength = gr.Slider(
+                minimum=0.1,
+                maximum=0.9,
+                value=0.3,
+                step=0.05,
+                label="Strength (0 = preserve image, 1 = change more)",
+            )
+            guidance_scale = gr.Slider(
+                minimum=2.0,
+                maximum=10.0,
+                value=5.0,
+                step=0.5,
+                label="Guidance scale",
+            )
+            num_steps = gr.Slider(
+                minimum=10,
+                maximum=50,
+                value=30,
+                step=1,
+                label="Inference steps",
+            )
+            seed = gr.Number(label="Seed (optional, int)", precision=0)
+            restyle_btn = gr.Button("Restyle image")
+
+        restyled_image_out = gr.Image(type="pil", label="Restyled image")
+        caption_used_out = gr.Textbox(label="Caption used for restyle", lines=4, max_lines=8)
+
+        restyle_btn.click(
+            fn=restyle_image,
+            inputs=[
+                restyle_img_in,
+                target_style,
+                caption_prompt_restyle,
+                negative_prompt,
+                strength,
+                guidance_scale,
+                num_steps,
+                seed,
+                restyle_use_tl,
+            ],
+            outputs=[restyled_image_out, caption_used_out],
         )
 
-    # ---------- internal helpers ----------
-
-    @staticmethod
-    def _to_pil(image: Union[str, Path, Image.Image]) -> Image.Image:
-        if isinstance(image, (str, Path)):
-            return Image.open(image).convert("RGB")
-        return image.convert("RGB")
-
-    def _predict_susy(self, pil_img: Image.Image) -> Dict[str, object]:
-        img_tensor = self.susy_preprocess(pil_img).unsqueeze(0).to(self.device)
-
-        with torch.no_grad():
-            logits = self.susy_model(img_tensor)
-            probs = torch.softmax(logits, dim=1)[0]
-
-        pred_idx = int(probs.argmax().item())
-        pred_class = self.susy_class_names[pred_idx]
-        confidence = float(probs[pred_idx].item())
-
-        prob_dict = {
-            name: float(probs[i]) for i, name in enumerate(self.susy_class_names)
-        }
-
-        return {
-            "pred_class": pred_class,
-            "confidence": confidence,
-            "probs": prob_dict,
-            "model_type": "transfer_learning_3class" if self.use_transfer_learning else "original_6class",
-        }
-
-    # ---------- public API (FAST) ----------
-
-    def analyze(
-        self,
-        image: Union[str, Path, Image.Image],
-        topk_styles: int = 5,
-        caption_prompt: Optional[str] = None,
-    ) -> Dict[str, object]:
-        """
-        Fast detectors-only call.
-
-        Returns:
-            {
-                "styles": [...],   # CLIP style predictions
-                "caption": "...",  # BLIP caption
-                "susy": {...},     # SuSy authenticity/source prediction
-            }
-        """
-        pil_img = self._to_pil(image)
-
-        styles = self.style_predictor.predict(pil_img, topk_styles=topk_styles)
-        caption = self.captioner.caption(pil_img, prompt=caption_prompt)
-        susy_result = self._predict_susy(pil_img)
-
-        return {
-            "styles": styles,
-            "caption": caption,
-            "susy": susy_result,
-        }
-
-    # ---------- public API (SLOW: image generation) ----------
-
-    def restyle_image(
-        self,
-        image: Union[str, Path, Image.Image],
-        target_style: str,
-        caption_prompt: Optional[str] = None,
-        negative_prompt: Optional[str] = None,
-        strength: float = 0.3,
-        guidance_scale: float = 5.0,
-        num_inference_steps: int = 30,
-        seed: Optional[int] = None,
-    ) -> Dict[str, object]:
-        """
-        Slow call: recreate the same image in a new style.
-
-        This is separated from `analyze` so that a frontend can:
-          1) call `analyze(...)` for instant detectors output
-          2) optionally call `restyle_image(...)` if the user requests a restyled image
-
-        Returns:
-            {
-                "restyled_image": PIL.Image.Image,
-                "caption_used": "...",
-            }
-        """
-        if self.restyler is None:
-            raise RuntimeError("Restyler is disabled. Initialise with enable_restyler=True.")
-
-        pil_img = self._to_pil(image)
-
-        caption = self.captioner.caption(pil_img, prompt=caption_prompt)
-
-        new_img = self.restyler.restyle(
-            image=pil_img,
-            base_prompt=caption,
-            target_style=target_style,
-            negative_prompt=negative_prompt,
-            strength=strength,
-            guidance_scale=guidance_scale,
-            num_inference_steps=num_inference_steps,
-            seed=seed,
-        )
-
-        return {
-            "restyled_image": new_img,
-            "caption_used": caption,
-        }
+# Enable share link if running on Colab/etc. Set share=True to enable public URL.
+if __name__ == "__main__":
+    demo.launch(share=True)

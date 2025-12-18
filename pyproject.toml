@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "artdetectors"
 version = "0.1.0"
-description = "CLIP, BLIP, fine-tuned SuSy, and SDXL-based image analysis + restyling pipeline"
+description = "CLIP, BLIP, SuSy, and SDXL-based image analysis + restyling pipeline"
 authors = [
   { name = "GaHyun Yoon, Abhitay Shinde, Christine Okubo" }
 ]
@@ -22,6 +22,10 @@ dependencies = [
   "ftfy",
   "regex",
   "tqdm",
+  "gradio",
+
+  # CLIP is not on PyPI; install separately:
+  # pip install git+https://github.com/openai/CLIP.git
 
   # image restyling (SDXL img2img)
   "diffusers>=0.31.0",
