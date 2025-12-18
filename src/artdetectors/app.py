@@ -256,3 +256,4 @@ with gr.Blocks() as demo:
 # Enable share link if running on Colab/etc. Set share=True to enable public URL.
 if __name__ == "__main__":
     demo.launch(share=True)
+
