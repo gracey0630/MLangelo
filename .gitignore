@@ -20,3 +20,6 @@ example_results
 
 # model
 src/artdetectors/models
+
+# venv
+eecs6893-final-proj-venv
