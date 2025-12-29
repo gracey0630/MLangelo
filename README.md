@@ -6,6 +6,10 @@ A unified pipeline for AI-generated image detection, style analysis, captioning,
 
 This project implements an end-to-end pipeline for detecting and analyzing AI-generated images from Reddit. The system combines multiple state-of-the-art models (CLIP, BLIP, SuSy) with custom transfer learning to classify images as authentic human art, DALL-E generated, or MidJourney generated.
 
+### Video Presentation & Demo
+https://youtu.be/5TIDhLOZu4U
+
+
 ### Architecture
 ```
 Reddit Data Collection → BigQuery Storage → AI Detection Pipeline → Results Analysis
